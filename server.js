@@ -14,6 +14,7 @@ const ANT_PROCESS_KEY = process.env.ANT_PROCESS_KEY;
 app.use(cors());
 app.use(express.json());
 
+console.log("server file")
 app.post("/deploy", async (req, res) => {
   const { repoUrl } = req.body;
 
