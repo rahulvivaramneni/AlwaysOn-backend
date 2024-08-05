@@ -1,6 +1,7 @@
 const express = require("express");
 const { exec } = require("child_process");
-const simpleGit = require("simple-git");
+const axios = require("axios");
+const unzipper = require("unzipper");
 const path = require("path");
 const fs = require("fs");
 const cors = require("cors");
@@ -14,7 +15,6 @@ const ANT_PROCESS_KEY = process.env.ANT_PROCESS_KEY;
 app.use(cors());
 app.use(express.json());
 
-console.log("server file")
 app.post("/deploy", async (req, res) => {
   const { repoUrl } = req.body;
 
@@ -22,76 +22,122 @@ app.post("/deploy", async (req, res) => {
     return res.status(400).json({ error: "Repository URL is required" });
   }
 
-  const repoName = path.basename(repoUrl, ".git");
+  const cleanedRepoUrl = repoUrl.replace(/\.git$/, "");
+  const repoName = path.basename(cleanedRepoUrl);
   const repoPath = path.join(__dirname, repoName);
   const distPath = path.join(repoPath, "dist");
 
+  const repoApiUrl =
+    cleanedRepoUrl.replace("github.com", "api.github.com/repos") + "/zipball";
+
   try {
-    // Clone the repository
-    await simpleGit().clone(repoUrl, repoPath);
+    // Download the repository as a ZIP file
+    const response = await axios({
+      url: repoApiUrl,
+      method: "GET",
+      responseType: "stream",
+      headers: {
+        Accept: "application/vnd.github.v3+json",
+        Authorization: `token ${process.env.GITHUB_TOKEN}`,
+      },
+    });
 
-    // Change directory to the cloned repository
-    process.chdir(repoPath);
+    // Create a write stream to save the ZIP file
+    const zipPath = path.join(__dirname, `${repoName}.zip`);
+    const writer = fs.createWriteStream(zipPath);
 
-    // Check if a build step is required
-    const hasPackageJson = fs.existsSync(path.join(repoPath, "package.json"));
-    if (hasPackageJson) {
-      // If package.json exists, assume the project has a build step
-      exec("npm install && npm run build", (error, stdout, stderr) => {
-        if (error) {
-          console.error("Build error:", error);
-          console.error("Build stderr:", stderr);
-          return res.status(500).json({ error: "Build failed" });
-        }
+    response.data.pipe(writer);
 
-        console.log("Build stdout:", stdout);
+    writer.on("finish", async () => {
+      // Extract the ZIP file
+      const directory = await unzipper.Open.file(zipPath);
+      await directory.extract({ path: __dirname });
 
-        // Create dist folder if it does not exist
+      // Clean up the ZIP file
+      fs.unlinkSync(zipPath);
+
+      // Logging to check the contents of the directory after extraction
+      const contents = fs.readdirSync(__dirname);
+      console.log("Contents of directory after extraction:", contents);
+
+      // Find the extracted folder (GitHub appends a hash to the folder name)
+      const extractedFolders = contents.filter(
+        (folder) =>
+          folder.includes(repoName) &&
+          fs.lstatSync(path.join(__dirname, folder)).isDirectory()
+      );
+
+      console.log("Extracted Folders:", extractedFolders);
+
+      if (extractedFolders.length === 0) {
+        console.error("No extracted folder found");
+        return res.status(500).json({ error: "No extracted folder found" });
+      }
+
+      const extractedFolder = extractedFolders[0];
+      const extractedPath = path.join(__dirname, extractedFolder);
+
+      console.log("Extracted Folder:", extractedFolder);
+
+      // Move extracted contents to the final repository path
+      fs.renameSync(extractedPath, repoPath);
+
+      // Proceed with the deployment process
+      process.chdir(repoPath);
+
+      const hasPackageJson = fs.existsSync(path.join(repoPath, "package.json"));
+      if (hasPackageJson) {
+        exec("npm install && npm run build", (error, stdout, stderr) => {
+          if (error) {
+            console.error("Build error:", error);
+            console.error("Build stderr:", stderr);
+            return res.status(500).json({ error: "Build failed" });
+          }
+
+          console.log("Build stdout:", stdout);
+
+          if (!fs.existsSync(distPath)) {
+            fs.mkdirSync(distPath);
+          }
+
+          fs.readdirSync("build").forEach((file) => {
+            fs.renameSync(path.join("build", file), path.join(distPath, file));
+          });
+
+          deployToArweave(res, repoPath);
+        });
+      } else {
         if (!fs.existsSync(distPath)) {
           fs.mkdirSync(distPath);
         }
 
-        // Move build files to dist folder
-        fs.readdirSync("build").forEach((file) => {
-          fs.renameSync(path.join("build", file), path.join(distPath, file));
-        });
+        fs.readdirSync(repoPath).forEach((file) => {
+          const srcPath = path.join(repoPath, file);
+          const destPath = path.join(distPath, file);
 
-        // Deploy to Arweave using permaweb-deploy
-        deployToArweave(res);
-      });
-    } else {
-      // No package.json, so assume it's a static site
-      // Create dist folder if it does not exist
-      console.log("disPath", distPath);
-      if (!fs.existsSync(distPath)) {
-        fs.mkdirSync(distPath);
-      }
-
-      console.log("repoPath", repoPath);
-
-      // Move static files to dist folder
-      fs.readdirSync(repoPath).forEach((file) => {
-        const srcPath = path.join(repoPath, file);
-        const destPath = path.join(distPath, file);
-
-        if (file !== "dist" && file !== ".git") {
-          if (fs.lstatSync(srcPath).isDirectory()) {
-            fs.renameSync(srcPath, destPath);
-          } else {
-            fs.renameSync(srcPath, destPath);
+          if (file !== "dist" && file !== ".git") {
+            if (fs.lstatSync(srcPath).isDirectory()) {
+              fs.renameSync(srcPath, destPath);
+            } else {
+              fs.renameSync(srcPath, destPath);
+            }
           }
-        }
-      });
-      // Deploy to Arweave using permaweb-deploy
-      deployToArweave(res);
-    }
+        });
+        deployToArweave(res, repoPath);
+      }
+    });
+
+    writer.on("error", (error) => {
+      console.error("Error writing ZIP file:", error);
+      res.status(500).json({ error: "Failed to download repository" });
+    });
   } catch (error) {
     console.error("Error:", error);
     res.status(500).json({ error: "Deployment process failed" });
   }
 });
 
-function deployToArweave(res) {
+function deployToArweave(res, repoPath) {
   exec(
     `npx permaweb-deploy --ant-process ${ANT_PROCESS_KEY}`,
     (error, stdout, stderr) => {
@@ -116,8 +162,7 @@ function deployToArweave(res) {
       const deployUrl = `https://arweave.net/${txId}`;
       res.json({ deployUrl });
 
-      // Clean up the cloned repository
-      fs.rmSync(path.join(__dirname, path.basename(repoUrl, ".git")), {
+      fs.rmSync(repoPath, {
         recursive: true,
         force: true,
       });
