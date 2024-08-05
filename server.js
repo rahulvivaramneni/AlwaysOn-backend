@@ -16,7 +16,15 @@ app.use(cors());
 app.use(express.json());
 
 app.post("/deploy", async (req, res) => {
-  const { repoUrl } = req.body;
+  let repoUrl;
+
+  if (req.headers["x-github-event"] === "push") {
+    // Handle GitHub webhook payload
+    repoUrl = req.body.repository.clone_url;
+  } else {
+    // Handle manual deployment request
+    repoUrl = req.body.repoUrl;
+  }
 
   if (!repoUrl) {
     return res.status(400).json({ error: "Repository URL is required" });
