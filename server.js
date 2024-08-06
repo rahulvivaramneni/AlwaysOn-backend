@@ -17,17 +17,21 @@ app.use(express.json());
 
 app.post("/deploy", async (req, res) => {
   let repoUrl;
+  let logs = "";
 
   if (req.headers["x-github-event"] === "push") {
     // Handle GitHub webhook payload
     repoUrl = req.body.repository.clone_url;
+    logs += "GitHub webhook event detected.\n";
   } else {
     // Handle manual deployment request
     repoUrl = req.body.repoUrl;
+    logs += "Manual deployment request received.\n";
   }
 
   if (!repoUrl) {
-    return res.status(400).json({ error: "Repository URL is required" });
+    logs += "Repository URL is missing.\n";
+    return res.status(400).json({ error: "Repository URL is required", logs });
   }
 
   const cleanedRepoUrl = repoUrl.replace(/\.git$/, "");
@@ -40,6 +44,7 @@ app.post("/deploy", async (req, res) => {
 
   try {
     // Download the repository as a ZIP file
+    logs += `Downloading repository from ${repoApiUrl}.\n`;
     const response = await axios({
       url: repoApiUrl,
       method: "GET",
@@ -57,16 +62,20 @@ app.post("/deploy", async (req, res) => {
     response.data.pipe(writer);
 
     writer.on("finish", async () => {
+      logs += `Repository downloaded to ${zipPath}.\n`;
+
       // Extract the ZIP file
+      logs += `Extracting repository.\n`;
       const directory = await unzipper.Open.file(zipPath);
       await directory.extract({ path: __dirname });
 
       // Clean up the ZIP file
       fs.unlinkSync(zipPath);
+      logs += "ZIP file cleaned up.\n";
 
       // Logging to check the contents of the directory after extraction
       const contents = fs.readdirSync(__dirname);
-      console.log("Contents of directory after extraction:", contents);
+      logs += `Contents of directory after extraction: ${contents.join(", ")}.\n`;
 
       // Find the extracted folder (GitHub appends a hash to the folder name)
       const extractedFolders = contents.filter(
@@ -75,34 +84,34 @@ app.post("/deploy", async (req, res) => {
           fs.lstatSync(path.join(__dirname, folder)).isDirectory()
       );
 
-      console.log("Extracted Folders:", extractedFolders);
+      logs += `Extracted Folders: ${extractedFolders.join(", ")}.\n`;
 
       if (extractedFolders.length === 0) {
-        console.error("No extracted folder found");
-        return res.status(500).json({ error: "No extracted folder found" });
+        logs += "No extracted folder found.\n";
+        return res.status(500).json({ error: "No extracted folder found", logs });
       }
 
       const extractedFolder = extractedFolders[0];
       const extractedPath = path.join(__dirname, extractedFolder);
-
-      console.log("Extracted Folder:", extractedFolder);
+      logs += `Extracted Folder: ${extractedFolder}.\n`;
 
       // Move extracted contents to the final repository path
       fs.renameSync(extractedPath, repoPath);
+      logs += `Repository moved to ${repoPath}.\n`;
 
       // Proceed with the deployment process
       process.chdir(repoPath);
 
       const hasPackageJson = fs.existsSync(path.join(repoPath, "package.json"));
       if (hasPackageJson) {
+        logs += "package.json found. Installing dependencies and building project.\n";
         exec("npm install && npm run build", (error, stdout, stderr) => {
           if (error) {
-            console.error("Build error:", error);
-            console.error("Build stderr:", stderr);
-            return res.status(500).json({ error: "Build failed" });
+            logs += `Build error: ${error}\nBuild stderr: ${stderr}\n`;
+            return res.status(500).json({ error: "Build failed", logs });
           }
 
-          console.log("Build stdout:", stdout);
+          logs += `Build stdout: ${stdout}\n`;
 
           if (!fs.existsSync(distPath)) {
             fs.mkdirSync(distPath);
@@ -112,9 +121,10 @@ app.post("/deploy", async (req, res) => {
             fs.renameSync(path.join("build", file), path.join(distPath, file));
           });
 
-          deployToArweave(res, repoPath);
+          deployToArweave(res, repoPath, logs);
         });
       } else {
+        logs += "package.json not found. Deploying static site.\n";
         if (!fs.existsSync(distPath)) {
           fs.mkdirSync(distPath);
         }
@@ -131,49 +141,50 @@ app.post("/deploy", async (req, res) => {
             }
           }
         });
-        deployToArweave(res, repoPath);
+        deployToArweave(res, repoPath, logs);
       }
     });
 
     writer.on("error", (error) => {
-      console.error("Error writing ZIP file:", error);
-      res.status(500).json({ error: "Failed to download repository" });
+      logs += `Error writing ZIP file: ${error}\n`;
+      res.status(500).json({ error: "Failed to download repository", logs });
     });
   } catch (error) {
-    console.error("Error:", error);
-    res.status(500).json({ error: "Deployment process failed" });
+    logs += `Error: ${error}\n`;
+    res.status(500).json({ error: "Deployment process failed", logs });
   }
 });
 
-function deployToArweave(res, repoPath) {
+function deployToArweave(res, repoPath, logs) {
   exec(
     `npx permaweb-deploy --ant-process ${ANT_PROCESS_KEY}`,
     (error, stdout, stderr) => {
       if (error) {
-        console.error("Deployment error:", error);
-        console.error("Deployment stderr:", stderr);
-        return res.status(500).json({ error: "Deployment failed" });
+        logs += `Deployment error: ${error}\nDeployment stderr: ${stderr}\n`;
+        return res.status(500).json({ error: "Deployment failed", logs });
       }
 
-      console.log("Deployment stdout:", stdout);
-      console.log("Deployment stderr:", stderr);
+      logs += `Deployment stdout: ${stdout}\nDeployment stderr: ${stderr}\n`;
 
       const match = stdout.match(/Bundle TxId \[(.+)\]/);
       const txId = match ? match[1] : null;
       if (!txId) {
-        console.error("Failed to retrieve transaction ID from output.");
+        logs += "Failed to retrieve transaction ID from output.\n";
         return res
           .status(500)
-          .json({ error: "Failed to retrieve transaction ID" });
+          .json({ error: "Failed to retrieve transaction ID", logs });
       }
 
       const deployUrl = `https://arweave.net/${txId}`;
-      res.json({ deployUrl });
+      logs += `Deployment successful. URL: ${deployUrl}\n`;
+      res.json({ deployUrl, logs });
 
+      // Clean up the cloned repository
       fs.rmSync(repoPath, {
         recursive: true,
         force: true,
       });
+      logs += `Repository cleaned up.\n`;
     }
   );
 }
