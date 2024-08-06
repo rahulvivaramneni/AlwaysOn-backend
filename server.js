@@ -120,6 +120,7 @@ app.post("/deploy", async (req, res) => {
       // Proceed with the deployment process
       process.chdir(repoPath);
 
+      // Check if a build step is required
       const hasPackageJson = fs.existsSync(path.join(repoPath, "package.json"));
       if (hasPackageJson) {
         logs +=
@@ -137,10 +138,12 @@ app.post("/deploy", async (req, res) => {
           logs += `Build stdout: ${stdout}\n`;
           console.log(`Build stdout: ${stdout}`);
 
+          // Create dist folder if it does not exist
           if (!fs.existsSync(distPath)) {
             fs.mkdirSync(distPath);
           }
 
+          // Move build files to dist folder
           fs.readdirSync("build").forEach((file) => {
             fs.renameSync(path.join("build", file), path.join(distPath, file));
           });
